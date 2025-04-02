@@ -93,9 +93,9 @@ class MCPClient:
         return result
 
 
-class DialogueAgent:
+class BaseAgent:
     """
-    An agent that manages dialogue generation using LLMs and MCP tools.
+    Base agent class that handles common tool calling patterns for all agents.
     """
     
     def __init__(self, client: AsyncAzureOpenAI, deployment_name: str, mcp_client: MCPClient):
@@ -103,6 +103,133 @@ class DialogueAgent:
         self.client = client
         self.deployment_name = deployment_name
         self.mcp_client = mcp_client
+    
+    async def _get_tools(self):
+        """Get available tools from MCP client"""
+        return await self.mcp_client.get_openai_tools()
+    
+    def _get_initial_messages(self, prompt: str):
+        """Create initial messages for the conversation"""
+        return [{"role": "user", "content": prompt}]
+    
+    def _process_final_response(self, msg):
+        """Process the final response from the LLM"""
+        print(f"\n=== {self._get_output_header()} ===\n")
+        print(msg.content)
+    
+    def _get_output_header(self):
+        """Get the header string for output"""
+        return "Output"
+    
+    async def _process_tool_calls(self, calls, messages, debug=False):
+        """Process tool calls and add results to messages"""
+        for call_info in calls:
+            fn_name = call_info.function.name
+            fn_args_json = call_info.function.arguments
+            fn_args = json.loads(fn_args_json)
+            
+            if debug:
+                print(f"\n[DEBUG] Calling tool: {fn_name}")
+                print(f"[DEBUG] Arguments: {json.dumps(fn_args, indent=2)}")
+            
+            # Execute the tool call
+            try:
+                result = await self.mcp_client.call_tool(fn_name, fn_args)
+                
+                # Extract the result text
+                result_text = result.content[0].text if hasattr(result, 'content') else str(result)
+                
+                if debug and len(result_text) < 1000:
+                    print(f"[DEBUG] Result: {result_text}")
+                elif debug:
+                    print(f"[DEBUG] Result: (too long to display, length: {len(result_text)})")
+                
+            except Exception as e:
+                error_message = str(e)
+                result_text = f"Error executing {fn_name}: {error_message}"
+                if debug:
+                    print(f"[DEBUG] Error: {error_message}")
+            
+            # Add the assistant message with tool call
+            messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_info.id,
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": fn_args_json
+                        }
+                    }
+                ]
+            })
+            
+            # Add the tool response
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_info.id,
+                "name": fn_name,
+                "content": result_text
+            })
+        
+        return messages
+    
+    def _should_add_intermediate_content(self, msg):
+        """Determine if intermediate content should be added to messages"""
+        return False
+    
+    async def run_agent_loop(self, prompt, debug=False):
+        """Main agent loop handling tool calls"""
+        tools = await self._get_tools()
+        
+        # Display available tools if in debug mode
+        if debug:
+            print(f"\n=== Available {self._get_output_header()} Tools ===")
+            for tool in tools:
+                print(f"- {tool['function']['name']}: {tool['function']['description']}")
+            print("\n")
+        
+        # Start with initial messages
+        messages = self._get_initial_messages(prompt)
+        
+        while True:
+            response = await self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+            
+            choice = response.choices[0]
+            msg = choice.message
+            
+            # If the model wants to use tools
+            if choice.finish_reason == "tool_calls":
+                calls = msg.tool_calls
+                if not calls:
+                    print("No calls found, but finish_reason=tool_calls. Exiting.")
+                    break
+                
+                # Process each tool call
+                messages = await self._process_tool_calls(calls, messages, debug)
+                
+                # Add the model's message to conversation if needed
+                if msg.content and self._should_add_intermediate_content(msg):
+                    messages.append({"role": "assistant", "content": msg.content})
+                
+                # Loop back for another LLM call
+                continue
+            
+            # If we have a final response, process it and exit
+            self._process_final_response(msg)
+            break
+
+
+class DialogueAgent(BaseAgent):
+    """
+    An agent that manages dialogue generation using LLMs and MCP tools.
+    """
     
     def get_prompt(self, name: str) -> str:
         """Generate the initial prompt for the dialogue."""
@@ -112,194 +239,44 @@ class DialogueAgent:
             f"{name} should yell every time and Mary should use sarcasm."
         )
     
+    def _get_initial_messages(self, name: str):
+        """Create initial messages for dialogue agent"""
+        return [{"role": "user", "content": self.get_prompt(name)}]
+    
+    def _get_output_header(self):
+        """Get the header string for output"""
+        return "Dialogue Output"
+    
     async def run(self, name: str):
         """Run the dialogue agent with the given name."""
-        # Get tools
-        tools = await self.mcp_client.get_openai_tools()
-        
-        # Start with the first message
-        messages = [
-            {"role": "user", "content": self.get_prompt(name)}
-        ]
-        
-        while True:
-            response = await self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
-            
-            choice = response.choices[0]
-            msg = choice.message
-            
-            # If the model wants to use tools
-            if choice.finish_reason == "tool_calls":
-                calls = msg.tool_calls
-                if not calls:
-                    print("No calls found, but finish_reason=tool_calls. Exiting.")
-                    break
-                
-                # Process each tool call
-                for call_info in calls:
-                    fn_name = call_info.function.name
-                    fn_args_json = call_info.function.arguments
-                    fn_args = json.loads(fn_args_json)
-                    
-                    # print(f"[DEBUG] Calling tool: {fn_name} with {fn_args}")
-                    
-                    # Execute the tool call
-                    result = await self.mcp_client.call_tool(fn_name, fn_args)
-                    
-                    # Extract the result text
-                    result_text = result.content[0].text if hasattr(result, 'content') else str(result)
-                    
-                    # Add the assistant message with tool call
-                    messages.append({
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": call_info.id,
-                                "type": "function",
-                                "function": {
-                                    "name": fn_name,
-                                    "arguments": fn_args_json
-                                }
-                            }
-                        ]
-                    })
-                    
-                    # Add the tool response
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_info.id,
-                        "name": fn_name,
-                        "content": result_text
-                    })
-                
-                # Loop back for another LLM call
-                continue
-            
-            # If we have a final response, print it and exit
-            print("\n=== Dialogue Output ===\n")
-            print(msg.content)
-            break
+        await self.run_agent_loop(name)
 
 
-class PostgreSQLAgent:
+class PostgreSQLAgent(BaseAgent):
     """
     An agent that interacts with PostgreSQL databases using LLMs and MCP tools.
     """
     
-    def __init__(self, client: AsyncAzureOpenAI, deployment_name: str, mcp_client: MCPClient):
-        """Initialize the agent with OpenAI client and MCP client"""
-        self.client = client
-        self.deployment_name = deployment_name
-        self.mcp_client = mcp_client
-    
-    async def run(self, prompt: str, debug: bool = False):
-        """Run the PostgreSQL agent with the given prompt."""
-        # Get tools
-        tools = await self.mcp_client.get_openai_tools()
-        
-        if debug:
-            print("\n=== Available PostgreSQL Tools ===")
-            for tool in tools:
-                print(f"- {tool['function']['name']}: {tool['function']['description']}")
-            print("\n")
-        
-        # Create an improved prompt that guides the model to first explore the schema
+    def _get_initial_messages(self, prompt: str):
+        """Create initial messages for PostgreSQL agent"""
         guided_prompt = (
             "Please help me interact with this PostgreSQL database. "
             "First, explore the available tables and their schema to understand the database structure. "
             "Then, answer this query: " + prompt
         )
-        
-        # Start with the user's prompt
-        messages = [
-            {"role": "user", "content": guided_prompt}
-        ]
-        
-        while True:
-            response = await self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
-            
-            choice = response.choices[0]
-            msg = choice.message
-            
-            # If the model wants to use tools
-            if choice.finish_reason == "tool_calls":
-                calls = msg.tool_calls
-                if not calls:
-                    print("No calls found, but finish_reason=tool_calls. Exiting.")
-                    break
-                
-                # Process each tool call
-                for call_info in calls:
-                    fn_name = call_info.function.name
-                    fn_args_json = call_info.function.arguments
-                    fn_args = json.loads(fn_args_json)
-                    
-                    if debug:
-                        print(f"\n[DEBUG] Calling PostgreSQL tool: {fn_name}")
-                        print(f"[DEBUG] Arguments: {json.dumps(fn_args, indent=2)}")
-                    
-                    # Execute the tool call
-                    try:
-                        result = await self.mcp_client.call_tool(fn_name, fn_args)
-                        
-                        # Extract the result text
-                        result_text = result.content[0].text if hasattr(result, 'content') else str(result)
-                        
-                        if debug and len(result_text) < 1000:
-                            print(f"[DEBUG] Result: {result_text}")
-                        elif debug:
-                            print(f"[DEBUG] Result: (too long to display, length: {len(result_text)})")
-                        
-                    except Exception as e:
-                        error_message = str(e)
-                        result_text = f"Error executing {fn_name}: {error_message}"
-                        if debug:
-                            print(f"[DEBUG] Error: {error_message}")
-                    
-                    # Add the assistant message with tool call
-                    messages.append({
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": call_info.id,
-                                "type": "function",
-                                "function": {
-                                    "name": fn_name,
-                                    "arguments": fn_args_json
-                                }
-                            }
-                        ]
-                    })
-                    
-                    # Add the tool response
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_info.id,
-                        "name": fn_name,
-                        "content": result_text
-                    })
-                
-                # Add the model's message to the conversation if it exists
-                if msg.content:
-                    messages.append({"role": "assistant", "content": msg.content})
-                
-                # Loop back for another LLM call
-                continue
-            
-            # If we have a final response, print it and exit
-            print("\n=== PostgreSQL Output ===\n")
-            print(msg.content)
-            break
+        return [{"role": "user", "content": guided_prompt}]
+    
+    def _get_output_header(self):
+        """Get the header string for output"""
+        return "PostgreSQL Output"
+    
+    def _should_add_intermediate_content(self, msg):
+        """PostgreSQL agent should add intermediate content if it exists"""
+        return bool(msg.content)
+    
+    async def run(self, prompt: str, debug: bool = False):
+        """Run the PostgreSQL agent with the given prompt."""
+        await self.run_agent_loop(prompt, debug)
 
 
 def get_server_params(server_type: Literal["dialogue", "postgres"], db_connection_string: Optional[str] = None) -> StdioServerParameters:

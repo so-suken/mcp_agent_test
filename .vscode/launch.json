@@ -8,9 +8,9 @@
             "name": "Python: client.py with sohta",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/client.py",
+            "program": "${workspaceFolder}/autogen_agent.py",
             "console": "integratedTerminal",
-            "args": ["sohta"]
+            "args": ["直近10件の会話履歴を教えて下さい"]
         }
     ]
 }

@@ -1,10 +1,18 @@
 [project]
 name = "mcp-test-simple"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP test with Autogen integration"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.6.0",
     "openai>=1.70.0",
+    "python-dotenv>=1.0.0",
+    "tiktoken>=0.5.2",
+    "autogen-ext[mcp]>=0.2.13",
+    "autogen>=0.8.5",
+    "autogen-agentchat>=0.5.1",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_test_simple"]

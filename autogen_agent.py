@@ -5,7 +5,6 @@ import traceback
 import json
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List
-from pathlib import Path
 
 # Import Autogen components for v0.4
 from autogen_agentchat.agents import AssistantAgent
@@ -13,7 +12,7 @@ from autogen_agentchat.teams import SelectorGroupChat
 # Import MCP components using the reference provided in the Qiita article
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
-from autogen_core import CancellationToken
+from autogen_core import CancellationToken  # NOTE: Agentを途中でキャンセル可能 → エージェントの回答生成途中にユーザから新しいメッセージが来たらCancel実行などの使い道?
 from autogen_core._types import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 from autogen_agentchat.messages import ToolCallSummaryMessage, TextMessage, ToolCallRequestEvent, ToolCallExecutionEvent
@@ -138,7 +137,6 @@ async def initialize_agents(model_client):
                 "You are a dialogue assistant that can create conversations between characters. "
                 "Use the available tools to generate interesting dialogue. "
                 "For yelling, use the 'yell' tool. For sarcasm, use the 'sarcasm' tool. "
-                "When you have completed your part, please end your reply with [TERMINATE_DIALOGUE]."
             )
         )
         worker_agents.append(dialogue_agent)
@@ -160,6 +158,7 @@ async def initialize_agents(model_client):
                     "When retrieving records, limit results to 10 records by default unless specified otherwise. "
                     "If the user asks for the latest/most recent records, use ORDER BY with appropriate timestamp or ID column in descending order."
                     "Max records to return is 10. "
+                    "Do not use * to retrieve all columns to avoid too much of information. if you need to use *, limit record to 1.\n\n"
                 )
             )
             worker_agents.append(postgres_agent)
@@ -244,45 +243,52 @@ def extract_content(response, default_message="No response content available"):
     # Last resort - convert to string 
     return str(response) if response else default_message
 
-async def process_query(query: str) -> str:
+async def process_query(query: str, chat=None, model_client=None) -> tuple:
     """
     Process the user's query using a SelectorGroupChat with planner and specialized agents.
     
     Args:
         query: The user's query
+        chat: Optional existing chat session
+        model_client: Optional existing model client
         
     Returns:
-        The final response from the agent team
+        Tuple of (response, chat, model_client) for maintaining session state
     """
     try:
         # Suppress warnings temporarily
         import warnings
         warnings.filterwarnings("ignore", category=UserWarning)
         
-        # Create model client
-        model_client = AzureOpenAIChatCompletionClient(
-            azure_deployment=AZURE_DEPLOYMENT,
-            api_key=AZURE_API_KEY,
-            api_version=AZURE_API_VERSION,
-            azure_endpoint=AZURE_ENDPOINT,
-            model=AZURE_MODEL,
-        )
+        # Create model client if not provided
+        if model_client is None:
+            model_client = AzureOpenAIChatCompletionClient(
+                azure_deployment=AZURE_DEPLOYMENT,
+                api_key=AZURE_API_KEY,
+                api_version=AZURE_API_VERSION,
+                azure_endpoint=AZURE_ENDPOINT,
+                model=AZURE_MODEL,
+            )
         
-        # Initialize agents
-        all_agents = await initialize_agents(model_client)
-        
-        if not all_agents:
-            return "Error: No agents available. Check the logs for initialization errors."
-        
-        # Create the SelectorGroupChat
-        chat = SelectorGroupChat(
-            participants=all_agents,
-            model_client=model_client,
-            selector_prompt=create_selector_prompt(),
-            termination_condition=create_termination_condition()
-        )
-        
-        print("Starting SelectorGroupChat to process the query...")
+        # Create chat if not provided
+        if chat is None:
+            # Initialize agents
+            all_agents = await initialize_agents(model_client)
+            
+            if not all_agents:
+                return "Error: No agents available. Check the logs for initialization errors.", None, None
+            
+            # Create the SelectorGroupChat
+            chat = SelectorGroupChat(
+                participants=all_agents,
+                model_client=model_client,
+                selector_prompt=create_selector_prompt(),
+                termination_condition=create_termination_condition()
+            )
+            
+            print("Starting SelectorGroupChat to process the query...")
+        else:
+            print("Continuing existing chat session...")
         
         # Run the chat to completion, collecting all messages
         messages = []
@@ -307,35 +313,93 @@ async def process_query(query: str) -> str:
         
         # Return the last message from a worker agent (not the planner) as the final answer
         # Or return a formatted summary of all messages if no clear final answer
+        response = ""
         if messages:
             # Try to find the last non-planner message
             for msg in reversed(messages):
                 if not msg.startswith("planner:"):
-                    return msg.split(":", 1)[1].strip()
+                    response = msg.split(":", 1)[1].strip()
+                    break
             
             # If only planner messages, return the last one
-            return messages[-1].split(":", 1)[1].strip()
+            if not response:
+                response = messages[-1].split(":", 1)[1].strip()
         else:
-            return "No response generated by the agent team."
+            response = "No response generated by the agent team."
+            
+        return response, chat, model_client
             
     except Exception as e:
         print(f"Error processing query: {e}")
         traceback.print_exc()
-        return f"Error processing your query: {str(e)}"
+        return f"Error processing your query: {str(e)}", None, None
+
+async def interactive_chat():
+    """Run an interactive chat session with the agent team"""
+    print("=== Interactive Multi-Agent Chat Session ===")
+    print("Type 'exit', 'quit', or 'bye' to end the session")
+    print("Type 'help' for suggestions on what to ask")
+    print("=========================================")
+    
+    chat = None
+    model_client = None
+    conversation_history = []
+    
+    while True:
+        try:
+            # Get user input
+            user_input = input("\n👤 You: ")
+            
+            # Check if user wants to exit
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                print("\nExiting chat session. Thank you for using the multi-agent system!")
+                break
+                
+            # Handle help command
+            if user_input.lower() == 'help':
+                print("\n💡 Suggestions:")
+                print("- Ask for a dialogue between [character1] and [character2]")
+                print("- Ask for database information (if PostgreSQL is set up)")
+                print("- Ask complex questions that might need multiple agents to solve")
+                print("- Ask to analyze data and present it in a readable format")
+                continue
+                
+            # Store user input in history
+            conversation_history.append(f"User: {user_input}")
+            
+            # Process the query
+            print("\n⏳ Processing...")
+            response, chat, model_client = await process_query(user_input, chat, model_client)
+            
+            # Display response
+            print("\n🤖 Agent: " + response)
+            
+            # Store agent response in history
+            conversation_history.append(f"Agent: {response}")
+            
+        except KeyboardInterrupt:
+            print("\n\nChat session interrupted. Exiting...")
+            break
+        except Exception as e:
+            print(f"\n⚠️ Error: {str(e)}")
+            traceback.print_exc()
 
 async def main():
-    """Main function to process the user's query"""
-    if len(sys.argv) < 2:
-        print("Usage: python autogen_agent.py \"your query here\"")
-        sys.exit(1)
-    
-    query = " ".join(sys.argv[1:])
-    print(f"Processing query: {query}")
-    
-    response = await process_query(query)
-    
-    print("\n=== Response ===\n")
-    print(response)
+    """Main function to either process a single query or start interactive chat"""
+    # Check if command line arguments are provided
+    if len(sys.argv) > 1:
+        # If arguments are provided, process a single query
+        query = " ".join(sys.argv[1:])
+        print(f"Processing query: {query}")
+        
+        response, _, _ = await process_query(query)
+        
+        print("\n=== Response ===\n")
+        print(response)
+        print("\nFor interactive mode, run without arguments: python autogen_agent.py")
+    else:
+        # No arguments - run interactive mode
+        await interactive_chat()
 
 if __name__ == "__main__":
     asyncio.run(main()) 

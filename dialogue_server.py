@@ -31,6 +31,22 @@ class DialogueServer:
                     sarcastic_phrase += char.lower()
             
             return sarcastic_phrase + " 🙃"
+        
+        @self.mcp.tool()
+        def emotional(phrase: str, emotion: str) -> str:
+            """Expresses a phrase with a specific emotion like happy, sad, angry, excited, etc."""
+            emotion_map = {
+                "happy": f"😄 {phrase} 😄",
+                "sad": f"😢 {phrase} 😢",
+                "angry": f"😠 {phrase}! 😠",
+                "excited": f"🤩 {phrase}!!! 🤩",
+                "surprised": f"😲 {phrase}?! 😲",
+                "worried": f"😟 {phrase}... 😟",
+                "confused": f"🤔 {phrase}??? 🤔"
+            }
+            
+            # Default to a generic emotion if not found
+            return emotion_map.get(emotion.lower(), f"[{emotion.upper()}] {phrase}")
     
     def run(self, transport: str = "stdio"):
         """Run the MCP server with the specified transport"""

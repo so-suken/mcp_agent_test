@@ -14,6 +14,9 @@ from autogen_agentchat.teams import SelectorGroupChat
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 from autogen_core import CancellationToken
+from autogen_core._types import FunctionCall
+from autogen_core.models import FunctionExecutionResult
+from autogen_agentchat.messages import ToolCallSummaryMessage, TextMessage, ToolCallRequestEvent, ToolCallExecutionEvent
 from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
 
 # Load environment variables
@@ -25,20 +28,6 @@ AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 AZURE_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o")
-
-# Initialize Azure OpenAI chat client
-def create_model_client():
-    """Create and return a model client for Azure OpenAI"""
-    model_client = AzureOpenAIChatCompletionClient(
-        azure_deployment=AZURE_DEPLOYMENT,
-        api_key=AZURE_API_KEY,
-        api_version=AZURE_API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT,
-        model=AZURE_MODEL,
-    )
-    
-    print(f"Initialized with Azure OpenAI deployment: {AZURE_DEPLOYMENT}, model: {AZURE_MODEL}")
-    return model_client
 
 async def get_dialogue_tools() -> List:
     """Get MCP tools for dialogue server"""
@@ -125,14 +114,10 @@ def create_selector_prompt() -> str:
     {history}
     """
 
-def create_termination_condition(keyword: str = "[TERMINATE]", max_turns: int = 15):
-    """Create a termination condition object for the group chat using Autogen's built-in conditions"""
-    
+def create_termination_condition(keyword: str = "[TERMINATE_ALL]", max_turns: int = 15):
     # Use Autogen's built-in termination conditions
     text_termination = TextMentionTermination(text=keyword)
     max_msg_termination = MaxMessageTermination(max_messages=max_turns)
-    
-    # Combine conditions with OR operator
     return text_termination | max_msg_termination
 
 async def initialize_agents(model_client):
@@ -152,7 +137,8 @@ async def initialize_agents(model_client):
             system_message=(
                 "You are a dialogue assistant that can create conversations between characters. "
                 "Use the available tools to generate interesting dialogue. "
-                "For yelling, use the 'yell' tool. For sarcasm, use the 'sarcasm' tool."
+                "For yelling, use the 'yell' tool. For sarcasm, use the 'sarcasm' tool. "
+                "When you have completed your part, please end your reply with [TERMINATE_DIALOGUE]."
             )
         )
         worker_agents.append(dialogue_agent)
@@ -173,6 +159,7 @@ async def initialize_agents(model_client):
                     "Then execute appropriate SQL queries to retrieve the data needed for the user's question.\n\n"
                     "When retrieving records, limit results to 10 records by default unless specified otherwise. "
                     "If the user asks for the latest/most recent records, use ORDER BY with appropriate timestamp or ID column in descending order."
+                    "Max records to return is 10. "
                 )
             )
             worker_agents.append(postgres_agent)
@@ -198,8 +185,8 @@ async def initialize_agents(model_client):
             "7. NEVER include any raw metadata in your response"
         )
     )
-    worker_agents.append(formatter_agent)
-    print("Formatter agent initialized")
+    # worker_agents.append(formatter_agent)
+    # print("Formatter agent initialized")
     
     # Create agents description for planner
     agents_description = "\n".join([f"{agent.name}: {agent.description}" for agent in worker_agents])
@@ -210,14 +197,12 @@ async def initialize_agents(model_client):
         description="Creates plans to fulfill user requests by coordinating specialized agents",
         model_client=model_client,
         system_message=(
-            "You are a planner that creates plans to fulfill user requests by coordinating specialized agents. "
-            f"You have the following agents available:\n{agents_description}\n\n"
-            "Create detailed plans with specific tasks for each agent based on their capabilities. "
-            "Always start by analyzing the user's request and determining which agents are needed. "
-            "Create a step-by-step plan with clear instructions for each agent. "
-            "After creating the plan, execute it by assigning tasks to the appropriate agents. "
-            "When all tasks are complete, summarize the results and respond to the user's request with a final answer. "
-            "If you need to terminate the conversation, end with [TERMINATE]."
+            "You are a planner that assigns tasks to the following specialized agents:\n"
+            " - dialogue_agent: for generating character-based dialogues\n"
+            " - postgres_agent: for querying the PostgreSQL database\n\n"
+            "Respond concisely. Only invoke an agent if truly necessary. "
+            "Once an agent finishes its role (it signals with its termination message), do not invoke it again."
+            "When you have completed your part, please end your reply with [TERMINATE_ALL]."
         )
     )
     print("Planner agent initialized with knowledge of all worker agents")
@@ -259,54 +244,6 @@ def extract_content(response, default_message="No response content available"):
     # Last resort - convert to string 
     return str(response) if response else default_message
 
-def clean_response(content):
-    """Clean up any remaining metadata or technical information from the response"""
-    # Remove any lines that look like metadata or technical details
-    if not isinstance(content, str):
-        return str(content)
-        
-    lines = content.split('\n')
-    cleaned_lines = []
-    
-    # Skip lines that look like technical metadata
-    for line in lines:
-        skip_line = False
-        metadata_indicators = [
-            "TaskResult", 
-            "response_type", 
-            "message.content", 
-            "content=", 
-            "output=",
-            "agent_type",
-            "metadata",
-            "autogen",
-            "object at 0x"
-        ]
-        
-        for indicator in metadata_indicators:
-            if indicator in line:
-                skip_line = True
-                break
-                
-        if not skip_line:
-            cleaned_lines.append(line)
-            
-    # Join the remaining lines
-    cleaned_content = '\n'.join(cleaned_lines)
-    
-    # If the content starts with JSON, try to clean it up
-    if cleaned_content.strip().startswith('{') and cleaned_content.strip().endswith('}'):
-        try:
-            # Try to parse as JSON and then format the core message
-            parsed = json.loads(cleaned_content)
-            if 'content' in parsed:
-                return parsed['content']
-        except:
-            # If JSON parsing fails, continue with the existing content
-            pass
-            
-    return cleaned_content
-
 async def process_query(query: str) -> str:
     """
     Process the user's query using a SelectorGroupChat with planner and specialized agents.
@@ -318,8 +255,18 @@ async def process_query(query: str) -> str:
         The final response from the agent team
     """
     try:
+        # Suppress warnings temporarily
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning)
+        
         # Create model client
-        model_client = create_model_client()
+        model_client = AzureOpenAIChatCompletionClient(
+            azure_deployment=AZURE_DEPLOYMENT,
+            api_key=AZURE_API_KEY,
+            api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT,
+            model=AZURE_MODEL,
+        )
         
         # Initialize agents
         all_agents = await initialize_agents(model_client)
@@ -342,7 +289,19 @@ async def process_query(query: str) -> str:
         async for message in chat.run_stream(task=query):
             # Skip non-message objects
             if hasattr(message, 'source') and hasattr(message, 'content'):
-                message_str = f"{message.source}: {message.content}"
+                # message_str = f"{message.source}: {message.content}"
+                if isinstance(message, ToolCallRequestEvent): #NOTE: also can check with list
+                    if isinstance(message.content[0], FunctionCall):
+                        message_str = f"{message.source}: Function calling...\n {message.content[0]}"
+                elif isinstance(message, ToolCallExecutionEvent): #NOTE: also can check with list
+                    if isinstance(message.content[0], FunctionExecutionResult):
+                        message_str = f"{message.source}: Fetched function result..."
+                else:
+                    if isinstance(message, ToolCallSummaryMessage):
+                        message_str = f"{message.source}: Summarizing tool call..."
+                    elif isinstance(message, TextMessage):
+                        message_str = f"{message.source}: {message.content}"
+                    
                 print(message_str)
                 messages.append(message_str)
         

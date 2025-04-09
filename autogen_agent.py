@@ -12,7 +12,7 @@ from autogen_agentchat.teams import SelectorGroupChat
 # Import MCP components using the reference provided in the Qiita article
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
-from autogen_core import CancellationToken  # NOTE: Agentを途中でキャンセル可能 → エージェントの回答生成途中にユーザから新しいメッセージが来たらCancel実行などの使い道?
+from autogen_core import CancellationToken  # NOTE: Agentを途中でキャンセル可能 → エージェントの回答生成途中にユーザから新しいメッセージが来たらCancel実行などの使い道?エージェントの応答が遅すぎるときも例外処理としてこれ投げれば良い
 from autogen_core._types import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 from autogen_agentchat.messages import ToolCallSummaryMessage, TextMessage, ToolCallRequestEvent, ToolCallExecutionEvent
@@ -74,7 +74,7 @@ async def get_postgres_tools() -> List:
         raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
     
     # Build connection string
-    db_connection_string = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}?sslmode=require"
+    db_connection_string = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}?sslmode=require"  #TODO: オフィスとか、これだと接続できない場所がある
     print(f"Generated connection string (password hidden): postgresql://{pg_user}:****@{pg_host}:{pg_port}/{pg_db}?sslmode=require")
     
     server_params = StdioServerParams(

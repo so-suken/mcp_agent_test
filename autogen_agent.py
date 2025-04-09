@@ -6,17 +6,15 @@ import json
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List
 
-# Import Autogen components for v0.4
-from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.teams import SelectorGroupChat
 # Import MCP components using the reference provided in the Qiita article
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
-from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 from autogen_core import CancellationToken  # NOTE: Agentを途中でキャンセル可能 → エージェントの回答生成途中にユーザから新しいメッセージが来たらCancel実行などの使い道?エージェントの応答が遅すぎるときも例外処理としてこれ投げれば良い
 from autogen_core._types import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 from autogen_agentchat.messages import ToolCallSummaryMessage, TextMessage, ToolCallRequestEvent, ToolCallExecutionEvent
-from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
+
+# Import the AgentManager class
+from mcp_agents import AgentManager
 
 # Load environment variables
 load_dotenv()
@@ -28,186 +26,15 @@ AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 AZURE_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o")
 
-async def get_dialogue_tools() -> List:
-    """Get MCP tools for dialogue server"""
-    print("Getting dialogue tools...")
-    
-    server_params = StdioServerParams(
-        command="python",
-        args=["dialogue_server.py"]
-    )
-    
-    try:
-        tools = await mcp_server_tools(server_params)
-        print(f"Found {len(tools)} dialogue tools")
-        for tool in tools:
-            print(f"- Tool: {tool.name}")
-        return tools
-    except Exception as e:
-        print(f"Error getting dialogue tools: {e}")
-        traceback.print_exc()
-        return []
-
-async def get_postgres_tools() -> List:
-    """Get MCP tools for PostgreSQL server"""
-    print("Getting PostgreSQL tools...")
-    
-    # Build connection string from environment variables
-    pg_user = os.getenv("POSTGRES_USER")
-    pg_password = os.getenv("POSTGRES_PASSWORD")
-    pg_host = os.getenv("POSTGRES_HOST")
-    pg_port = os.getenv("POSTGRES_PORT", "5432")
-    pg_db = os.getenv("POSTGRES_DB")
-    
-    # Validate required environment variables
-    missing_vars = []
-    if not pg_user:
-        missing_vars.append("POSTGRES_USER")
-    if not pg_password:
-        missing_vars.append("POSTGRES_PASSWORD")
-    if not pg_host:
-        missing_vars.append("POSTGRES_HOST")
-    if not pg_db:
-        missing_vars.append("POSTGRES_DB")
-        
-    if missing_vars:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
-    # Build connection string
-    db_connection_string = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}?sslmode=require"  #TODO: オフィスとか、これだと接続できない場所がある
-    print(f"Generated connection string (password hidden): postgresql://{pg_user}:****@{pg_host}:{pg_port}/{pg_db}?sslmode=require")
-    
-    server_params = StdioServerParams(
-        command="npx",
-        args=[
-            "-y",
-            "@modelcontextprotocol/server-postgres",
-            db_connection_string
-        ]
-    )
-    
-    try:
-        tools = await mcp_server_tools(server_params)
-        print(f"Found {len(tools)} PostgreSQL tools")
-        for tool in tools:
-            print(f"- Tool: {tool.name}")
-        return tools
-    except Exception as e:
-        print(f"Error getting PostgreSQL tools: {e}")
-        traceback.print_exc()
-        return []
-
-def create_selector_prompt() -> str:
-    """Create the selector prompt for SelectorGroupChat"""
-    return """
-    Below is a conversation where a user has made a request, and a planner is coordinating specialized agents to fulfill it.
-    The planner has already created a plan with specific tasks for each agent based on their capabilities.
-    
-    Team members and their roles:
-    {roles}
-    
-    Based on the current conversation and tasks being discussed, which team member should respond next?
-    Select one team member from {participants} who is best suited to handle the current task or situation.
-    Return only the name of the selected team member.
-    
-    {history}
-    """
-
-def create_termination_condition(keyword: str = "[TERMINATE_ALL]", max_turns: int = 15):
-    # Use Autogen's built-in termination conditions
-    text_termination = TextMentionTermination(text=keyword)
-    max_msg_termination = MaxMessageTermination(max_messages=max_turns)
-    return text_termination | max_msg_termination
-
-async def initialize_agents(model_client):
-    """Initialize all available worker agents and return them"""
-    print("Initializing worker agents...")
-    
-    worker_agents = []
-    
-    # Create dialogue agent with tools
-    dialogue_tools = await get_dialogue_tools()
-    if dialogue_tools:
-        dialogue_agent = AssistantAgent(
-            name="dialogue_agent",
-            description="Creates conversations, dialogues, and interactions between characters. Can express emotions like yelling and sarcasm.",
-            model_client=model_client,
-            tools=dialogue_tools,
-            system_message=(
-                "You are a dialogue assistant that can create conversations between characters. "
-                "Use the available tools to generate interesting dialogue. "
-                "For yelling, use the 'yell' tool. For sarcasm, use the 'sarcasm' tool. "
-            )
-        )
-        worker_agents.append(dialogue_agent)
-        print("Dialogue agent initialized with tools")
-    
-    # Create PostgreSQL agent with tools
-    try:
-        postgres_tools = await get_postgres_tools()
-        if postgres_tools:
-            postgres_agent = AssistantAgent(
-                name="postgres_agent",
-                description="Retrieves and analyzes data from PostgreSQL databases. Can explore database schemas and run SQL queries.",
-                model_client=model_client,
-                tools=postgres_tools,
-                system_message=(
-                    "You are a database query assistant that retrieves data from PostgreSQL databases. "
-                    "First, explore the available tables and their schema to understand the database structure. "
-                    "Then execute appropriate SQL queries to retrieve the data needed for the user's question.\n\n"
-                    "When retrieving records, limit results to 10 records by default unless specified otherwise. "
-                    "If the user asks for the latest/most recent records, use ORDER BY with appropriate timestamp or ID column in descending order."
-                    "Max records to return is 10. "
-                    "Do not use * to retrieve all columns to avoid too much of information. if you need to use *, limit record to 1.\n\n"
-                )
-            )
-            worker_agents.append(postgres_agent)
-            print("PostgreSQL agent initialized with tools")
-    except ValueError as e:
-        print(f"PostgreSQL agent initialization skipped: {e}")
-        
-    # Create formatter agent (no tools required)
-    formatter_agent = AssistantAgent(
-        name="formatter_agent",
-        description="Formats data into clean, well-organized, human-friendly responses. Specializes in creating tabular displays and removing technical details.",
-        model_client=model_client,
-        system_message=(
-            "You are a results formatter that creates clear, concise responses based on raw data. "
-            "Take raw results and create a well-formatted, human-friendly response that directly answers the user's question.\n\n"
-            "Guidelines:\n"
-            "1. Present data in a clean, tabular format when showing records\n"
-            "2. Add a brief explanation of what the data represents\n"
-            "3. Focus only on the data that answers the user's specific question\n"
-            "4. Do not include technical details in your response\n"
-            "5. Format numeric data and dates in a readable way\n"
-            "6. Be concise and direct\n"
-            "7. NEVER include any raw metadata in your response"
-        )
-    )
-    # worker_agents.append(formatter_agent)
-    # print("Formatter agent initialized")
-    
-    # Create agents description for planner
-    agents_description = "\n".join([f"{agent.name}: {agent.description}" for agent in worker_agents])
-    
-    # Create planner agent with knowledge of available agents
-    planner = AssistantAgent(
-        name="planner",
-        description="Creates plans to fulfill user requests by coordinating specialized agents",
-        model_client=model_client,
-        system_message=(
-            "You are a planner that assigns tasks to the following specialized agents:\n"
-            " - dialogue_agent: for generating character-based dialogues\n"
-            " - postgres_agent: for querying the PostgreSQL database\n\n"
-            "Respond concisely. Only invoke an agent if truly necessary. "
-            "Once an agent finishes its role (it signals with its termination message), do not invoke it again."
-            "When you have completed your part, please end your reply with [TERMINATE_ALL]."
-        )
-    )
-    print("Planner agent initialized with knowledge of all worker agents")
-    
-    # Return all agents including the planner
-    return worker_agents + [planner]
+# Configure which agents to use in the chat
+# Set to True to enable an agent, False to disable
+ENABLED_AGENTS = {
+    "dialogue_agent": True,   # Dialog generation agent
+    "postgres_agent": True,   # PostgreSQL database agent
+    "formatter_agent": False,  # Data formatting agent
+    # To enable a custom agent, uncomment this line:
+    # "custom_agent": False    # Custom agent example
+}
 
 def extract_content(response, default_message="No response content available"):
     """Extract content from various response types including TaskResult objects"""
@@ -243,7 +70,7 @@ def extract_content(response, default_message="No response content available"):
     # Last resort - convert to string 
     return str(response) if response else default_message
 
-async def process_query(query: str, chat=None, model_client=None) -> tuple:
+async def process_query(query: str, chat=None, model_client=None, agent_manager=None) -> tuple:
     """
     Process the user's query using a SelectorGroupChat with planner and specialized agents.
     
@@ -251,9 +78,10 @@ async def process_query(query: str, chat=None, model_client=None) -> tuple:
         query: The user's query
         chat: Optional existing chat session
         model_client: Optional existing model client
+        agent_manager: Optional existing agent manager
         
     Returns:
-        Tuple of (response, chat, model_client) for maintaining session state
+        Tuple of (response, chat, model_client, agent_manager) for maintaining session state
     """
     try:
         # Suppress warnings temporarily
@@ -272,19 +100,26 @@ async def process_query(query: str, chat=None, model_client=None) -> tuple:
         
         # Create chat if not provided
         if chat is None:
-            # Initialize agents
-            all_agents = await initialize_agents(model_client)
+            # Create agent manager if not provided
+            if agent_manager is None:
+                agent_manager = AgentManager(model_client)
+                
+                # Example of how to register a custom agent:
+                # agent_manager.register_agent_type(
+                #     "custom_agent",
+                #     "mcp_agents.custom_agent",
+                #     "create_custom_agent",
+                #     enabled=False
+                # )
+                
+                # Configure which agents to use
+                agent_manager.configure_agents(ENABLED_AGENTS)
             
-            if not all_agents:
-                return "Error: No agents available. Check the logs for initialization errors.", None, None
+            # Create the chat with the agent manager
+            chat = await agent_manager.create_chat()
             
-            # Create the SelectorGroupChat
-            chat = SelectorGroupChat(
-                participants=all_agents,
-                model_client=model_client,
-                selector_prompt=create_selector_prompt(),
-                termination_condition=create_termination_condition()
-            )
+            if not chat:
+                return "Error: No agents available. Check the logs for initialization errors.", None, None, None
             
             print("Starting SelectorGroupChat to process the query...")
         else:
@@ -295,7 +130,6 @@ async def process_query(query: str, chat=None, model_client=None) -> tuple:
         async for message in chat.run_stream(task=query):
             # Skip non-message objects
             if hasattr(message, 'source') and hasattr(message, 'content'):
-                # message_str = f"{message.source}: {message.content}"
                 if isinstance(message, ToolCallRequestEvent): #NOTE: also can check with list
                     if isinstance(message.content[0], FunctionCall):
                         message_str = f"{message.source}: Function calling...\n {message.content[0]}"
@@ -327,22 +161,24 @@ async def process_query(query: str, chat=None, model_client=None) -> tuple:
         else:
             response = "No response generated by the agent team."
             
-        return response, chat, model_client
+        return response, chat, model_client, agent_manager
             
     except Exception as e:
         print(f"Error processing query: {e}")
         traceback.print_exc()
-        return f"Error processing your query: {str(e)}", None, None
+        return f"Error processing your query: {str(e)}", None, None, None
 
 async def interactive_chat():
     """Run an interactive chat session with the agent team"""
     print("=== Interactive Multi-Agent Chat Session ===")
     print("Type 'exit', 'quit', or 'bye' to end the session")
     print("Type 'help' for suggestions on what to ask")
+    print("Type 'config' to see or update agent configuration")
     print("=========================================")
     
     chat = None
     model_client = None
+    agent_manager = None
     conversation_history = []
     
     while True:
@@ -363,13 +199,30 @@ async def interactive_chat():
                 print("- Ask complex questions that might need multiple agents to solve")
                 print("- Ask to analyze data and present it in a readable format")
                 continue
+            
+            # Handle config command to view or update agent configuration
+            if user_input.lower() == 'config':
+                if agent_manager:
+                    print(f"\nCurrent agent configuration: {agent_manager.agent_config}")
+                    update = input("Would you like to update the configuration? (y/n): ")
+                    if update.lower() == 'y':
+                        for agent_type in agent_manager.agent_config:
+                            enabled = input(f"Enable {agent_type}? (y/n): ")
+                            agent_manager.agent_config[agent_type] = enabled.lower() == 'y'
+                        
+                        print(f"Updated configuration: {agent_manager.agent_config}")
+                        # Recreate chat with new configuration
+                        chat = None
+                else:
+                    print("\nAgent manager not initialized yet. Start a conversation first.")
+                continue
                 
             # Store user input in history
             conversation_history.append(f"User: {user_input}")
             
             # Process the query
             print("\n⏳ Processing...")
-            response, chat, model_client = await process_query(user_input, chat, model_client)
+            response, chat, model_client, agent_manager = await process_query(user_input, chat, model_client, agent_manager)
             
             # Display response
             print("\n🤖 Agent: " + response)
@@ -392,7 +245,7 @@ async def main():
         query = " ".join(sys.argv[1:])
         print(f"Processing query: {query}")
         
-        response, _, _ = await process_query(query)
+        response, _, _, _ = await process_query(query)
         
         print("\n=== Response ===\n")
         print(response)

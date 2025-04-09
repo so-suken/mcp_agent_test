@@ -62,8 +62,61 @@ The system includes several specialized agents:
 1. **Planner Agent**: Coordinates other agents and assigns tasks based on the request
 2. **Dialogue Agent**: Creates dialogue with emotional expressions
 3. **PostgreSQL Agent**: Queries databases (if configured)
+4. **Formatter Agent**: Formats data into clean, human-friendly responses (disabled by default)
 
 The `SelectorGroupChat` manages the conversation between these agents, selecting which one should respond next based on the task.
+
+## Agent Architecture
+
+The system uses a modular agent architecture:
+
+1. **Agent Definition**: Each agent is defined in its own file in the `mcp_agents` directory
+2. **AgentManager**: A central class that manages agent configuration, initialization, and selection
+3. **Configuration**: Agents can be easily enabled or disabled in the `ENABLED_AGENTS` dictionary
+
+### Enabling/Disabling Agents
+
+You can control which agents are available by modifying the `ENABLED_AGENTS` dictionary in `autogen_agent.py`:
+
+```python
+ENABLED_AGENTS = {
+    "dialogue_agent": True,   # Dialog generation agent
+    "postgres_agent": True,   # PostgreSQL database agent
+    "formatter_agent": False  # Data formatting agent (disabled by default)
+}
+```
+
+You can also change this configuration during runtime by typing `config` in the interactive chat.
+
+### Adding Your Own Agent
+
+To create a new agent:
+
+1. Create a new file in the `mcp_agents` directory (use `custom_agent.py` as a template)
+2. Define a function that creates your agent (make it async if it needs to fetch tools)
+3. Register your agent in the AgentManager
+
+Example of registering a custom agent:
+
+```python
+# Register a custom agent with AgentManager
+agent_manager.register_agent_type(
+    "custom_agent",
+    "mcp_agents.custom_agent",
+    "create_custom_agent",
+    enabled=True
+)
+```
+
+The first parameter is the agent name, the second is the module path, and the third is the function name in that module.
+
+### Lazy Loading
+
+The system now uses lazy loading, which means:
+
+1. Agent creation functions are only loaded when needed
+2. You can add new agent types without modifying existing code
+3. Modules are imported on-demand, improving startup performance
 
 ## Tips for Effective Conversations
 

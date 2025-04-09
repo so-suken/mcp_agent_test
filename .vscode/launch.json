@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/autogen_agent.py",
             "console": "integratedTerminal",
-            "args": ["直近10件の会話履歴を教えて下さい"]
+            // "args": ["直近10件の会話履歴を教えて下さい"]
         }
     ]
 }

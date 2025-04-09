@@ -15,7 +15,7 @@ This project demonstrates how to build a multi-agent system using [Microsoft Aut
 1. Clone this repository
 2. Install the dependencies:
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 3. Create a `.env` file with your Azure OpenAI credentials:
 ```
